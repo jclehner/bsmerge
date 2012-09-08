@@ -1,0 +1,395 @@
+#!/bin/bash
+
+if [[ $# -eq 0 ]]; then
+	echo "usage: bsmerge [ebuild commandline]" >&2
+	exit 1
+fi
+
+###################################################
+
+
+# Put a little dot next to each one - the major likes dots!
+_dot()
+{
+	printf "\033[01;$1m[*]\033[00m "
+}
+
+gdot() {
+	_dot 32
+}
+
+rdot() {
+	_dot 31
+}
+
+IN_EBEGIN=0
+
+ebegin() 
+{
+	IN_EBEGIN=1
+	gdot
+	echo -en "$@ ... "
+}
+
+einfo()
+{
+	if [ $IN_EBEGIN -eq 1 ]; then
+		IN_EBEGIN=0
+		echo
+	fi
+	gdot
+	echo -e "$@"
+}
+
+einfo2() {
+	echo -n "  "
+	einfo "$@"
+}
+
+eend() {
+	[ $IN_EBEGIN -eq 0 ] && return 0
+	IN_EBEGIN=0
+	( [ $1 -eq 0 ] && echo " [OK]") || echo " [!!]"
+}
+
+eerror() {
+	[ $IN_EBEGIN -eq 1 ] && eend 1
+	rdot >&2
+	echo "Error: $@" >&2
+}
+
+ewarn() {
+	rdot >&2
+	echo "Warning: $@" >&2
+}
+
+die()
+{
+	eerror "$@"
+	exit 1
+}
+
+dumpvar()
+{
+	eval "echo '$1='\$$1"
+}
+
+dossh()
+{
+	[ $# -eq 0 ] && die "dossh"
+	ssh -o PasswordAuthentication=no -p ${SSH_PORT:-22} ${SSH_USER:-${USER}}@${SSH_HOST} $*
+	return $?
+}
+
+# push(local, remote, opts)
+dopush()
+{
+	[ $# -lt 2 ] && die "dopush"
+	scp $3 -P ${SSH_PORT:-22} "$1" ${SSH_USER:-${USER}}@${SSH_HOST}:"$2" >> /dev/null
+	return $?
+}
+
+# pull(remote, local, opts)
+dopull()
+{
+	[ $# -lt 2 ] && die "dopush"
+	scp $3 -P ${SSH_PORT:-22} ${SSH_USER:-${USER}}@${SSH_HOST}:"$1" "$2" >> /dev/null
+	return $?
+}
+
+if [[ "$1" == "--non-interactive" ]]; then
+	shift 
+
+	askcont() {
+		:
+	}
+else
+	askcont()
+	{
+		gdot
+		read -p "Continue (ENTER) or quit (CTRL + C)?" 
+	}
+fi
+
+cleanup_slave()
+{
+	ebegin "Cleaning up on slave"
+	if [ ! -z ${BINSLAVE_PORTAGE_CONFIGROOT} ]; then
+		dossh umount /etc/portage &> /dev/null
+	fi
+	eend $?
+}
+
+makepkglist()
+{
+	read -ra PKGLIST <<< $(cat "${1}" | grep -P '^\[ebuild' | sed -re 's/^\[ebuild(\w|\s)+\]//' | awk '{ print $1 }')
+}
+
+qrun() {
+	if ! ( "$@" &> ${TMP}; RET=$? ) then
+		eerror "$1 exited with status ${RET}"
+		echo >&2
+		cat ${TMP} >&2
+		exit 1
+	fi
+}
+
+is_same_version() 
+{
+	[[ $# -eq 2 ]] || die "is_same_version"
+
+	read -ra ATOM_1 $(qatom "$1")
+	read -ra ATOM_2 $(qatom "$2")
+
+	# 0: category
+	# 1: package name
+	# 2: version
+	# 3: revision
+
+	if [[ ${ATOM_1[1]} != ${ATOM_2[1]} ]]; then
+		false
+	elif [[ ${ATOM_1[2]} != ${ATOM_2[2]} ]]; then
+		false
+	else
+		true
+	fi
+}
+
+# execute emerge command and extract ebuilds atoms, putting them in PKGLIST (array) and PKGS (string)
+as_pkglist_and_pkgs()
+{
+	PKGLIST=
+	PKGS=
+
+	qrun "$@"
+	read -ra PKGLIST <<< $(grep -P '^\[' ${TMP} | sed -re 's/\[([^]])+\]//' | awk '{ print $1 }')
+
+	for PKG in "${PKGLIST[@]}"; do
+		PKGS="${PKGS} =${PKG}"
+	done
+
+	if [[ ${#PKGLIST[@]} -eq 0 ]]; then
+		die "Package list is empty"
+	fi
+}
+
+show_tmp_filtered()
+{
+	echo
+	grep -P '^\[' ${TMP}
+	echo
+	grep -P '^Total:' ${TMP}
+	echo
+}
+
+get_kernel_config_file()
+{
+	local config="/usr/src/linux-$(uname -r)/.config"
+	if [[ -f "$config" ]]; then
+		echo $config
+	elif [[ -f /proc/config.gz ]]; then
+		local tmpconfig=$(mktemp)
+		zcat /proc/config.gz > $tmpconfig
+		echo $tmpconfig
+	fi
+}
+		
+
+###################################################
+TOOLS="scp ssh qatom"
+
+for TOOL in $TOOLS; do
+	if ! command -v $TOOL &> /dev/null; then
+		die "$TOOL not found"
+	fi
+done
+
+source "/etc/make.conf" &> /dev/null || die "Missing config file /etc/make.conf"
+
+if [[ -f "/etc/bmerge.conf" ]]; then
+	ewarn "Please rename /etc/bmerge.conf to /etc/bsmerge.conf"
+	source "/etc/bmerge.conf"
+	BSMERGE_MASTER_ID="${BMERGE_MASTER_ID}"
+elif ! source "/etc/bsmerge.conf" &> /dev/null; then
+	die "Missing config file /etc/bsmerge.conf"
+fi
+
+ebegin "Collecting portage config information"
+[ -z ${PORTDIR} ] && PORTDIR=$(portageq envvar PORTDIR)
+PROFILE=$(readlink -f /etc/make.profile | sed -re "s:^${PORTDIR}/*profiles/*::")
+eend 0
+
+if [ -z ${BSMERGE_MASTER_ID} ]; then
+	ebegin "Generating master ID"
+
+	RANDSOURCE=/proc/sys/kernel/random/uuid
+	if [ ! -f ${RANDSOURCE} ]; then
+		die "No ${RANDSOURCE}. Manually set BSMERGE_MASTER_ID to a UUID."
+	fi
+
+	BSMERGE_MASTER_ID=$(cat ${RANDSOURCE})
+
+	if grep -qP '^BSMERGE_MASTER_ID' /etc/bmerge.conf; then
+		sed -rie 's/BSMERGE_MASTER_ID=.*$/BSMERGE_MASTER_ID='${BSMERGE_MASTER_ID}'/' /etc/bmerge.conf
+	else
+		echo "BSMERGE_MASTER_ID=${BSMERGE_MASTER_ID}" >> /etc/bmerge.conf
+	fi
+
+	eend 0
+fi
+
+einfo "Master ID: ${BSMERGE_MASTER_ID}" 
+
+# check whether we can connect without password
+ebegin "Checking whether we can connect to ${SSH_HOST}"
+if ! dossh true &> /dev/null; then
+	eerror "Could not connect to host. Falling back to local emerge instead."
+	emerge $*
+	exit $?
+fi
+eend 0
+
+ebegin "Checking binslave environment for (in)sanity"
+
+LOCAL_LIBC=$( $(ls /lib/libc.so.* | tail -n1) | head -n1 | sed -re "s/.* version//" | sed -re "s/,.*//" )
+[[ -z "${LOCAL_LIBC}" ]] && die "Failed to get local libc version"
+
+REMOTE_LIBC=$(dossh '$(ls /lib/libc.so.* | tail -n1) | head -n1 | sed -re "s/.* version//" | sed -re "s/,.*//"')
+[[ -z "${REMOTE_LIBC}" ]] && die "Failed to get remote libc version"
+
+if [[ "${LOCAL_LIBC}" != "${REMOTE_LIBC}" ]]; then
+	eerror "Found libc version mismatch, refusing to continue"
+	eerror "Local: ${LOCAL_LIBC}"
+	die "Remote: ${REMOTE_LIBC}"
+fi
+
+eend 0
+
+TMP=$(mktemp)
+EMERGE_ARGS="$@"
+
+ebegin "Determining which packages to merge locally"
+as_pkglist_and_pkgs emerge -pv ${EMERGE_ARGS}
+eend 0
+
+show_tmp_filtered
+askcont
+
+einfo "Synchronizing with slave"
+
+#if dossh test -f /etc/portage/make.conf; then
+#	die "Refusing to overwrite /etc/portage/make.conf on slave"
+#fi
+
+VARS_FROM_SLAVE="DISTDIR|PORTDIR|PORTDIR_OVERLAY|MAKEOPTS"
+
+dossh mv /etc/make.conf /etc/portage/ &> /dev/null
+dossh mv /etc/make.profile /etc/portage/ &> /dev/null
+
+BINSLAVE_DIR=${BINSLAVE_SYSROOT}/var/binslave/${BSMERGE_MASTER_ID}
+BINSLAVE_PKGDIR=${BINSLAVE_DIR}/packages
+BINSLAVE_PORTAGE_CONFIGROOT=${BINSLAVE_DIR}
+dossh mkdir -p ${BINSLAVE_DIR}/etc/portage
+dossh mkdir -p ${BINSLAVE_PKGDIR}
+
+L_MAKE_CONF=$(mktemp)
+
+cat > ${L_MAKE_CONF} <<EOF
+#
+# Automatically created by bmerge
+# Date/Time: $(date -R)
+# Master ID: ${BSMERGE_MASTER_ID}
+#
+EOF
+
+grep -v -P "^(${VARS_FROM_SLAVE}|PKGDIR)=" /etc/make.conf >> ${L_MAKE_CONF}
+dossh cat /etc/portage/make.conf  | grep -P "^(${VARS_FROM_SLAVE})=" >> ${L_MAKE_CONF}
+
+cat >> ${L_MAKE_CONF} <<EOF
+PKGDIR="${BINSLAVE_PKGDIR}"
+KERNEL_DIR="${BINSLAVE_DIR}/kernel"
+EOF
+
+einfo2 "Pushing new make.conf to binslave"
+dopush ${L_MAKE_CONF} ${BINSLAVE_PORTAGE_CONFIGROOT}/etc/portage/make.conf || die "dopush"
+eend 0
+
+TIMESTAMP_CHK=$(dossh cat ${BINSLAVE_DIR}/timestamp.chk 2> /dev/null || echo 0)
+
+einfo2 "Pushing portage configuration to binslave"
+for F in /etc/portage/{use,package}.*; do
+	if [[ ! -e "${F}" ]]; then
+		# When globbing fails, ${F} might contain an unexpanded pattern
+		continue
+	elif [[ -d "${F}" ]]; then
+		PUSH_ARGS="-r"
+	fi
+
+	#if [[ $(stat -c %Y "${F}") -gt ${TIMESTAMP_CHK} ]]; then
+		echo "    ${F}"
+		dopush "${F}" "${BINSLAVE_DIR}/etc/portage" ${PUSH_ARGS}
+	#else
+	#	echo "    skipping ${F}"
+	#fi
+done
+
+einfo2 "Pushing kernel configuration to binslave"
+
+dossh "echo export KERNEL_DIR=\"${BINSLAVE_DIR}/kernel\" > ${BINSLAVE_DIR}/etc/portage/bashrc"
+
+KCONFIG=$(get_kernel_config_file)
+if [[ -z "${KCONFIG}" ]]; then
+	die "Could not find local kernel config"
+fi
+
+dossh mkdir -p "${BINSLAVE_DIR}/kernel"
+dopush "${KCONFIG}" "${BINSLAVE_DIR}/kernel/.config" || die "dopush"
+# Now trick portage into looking in kernel/linux-<remote kernel version>
+# which actually contains the local kernel config
+REMOTE_KVER=$(dossh uname -r)
+dossh ln -sf "${BINSLAVE_DIR}/kernel" "${BINSLAVE_DIR}/kernel/linux-${REMOTE_KVER}" || die "dossh"
+
+date +%s | dossh 'cat > ${BINSLAVE_DIR}/timestamp.chk'
+
+eend 0
+
+echo -n "  "
+ebegin "Setting profile on binslave"
+qrun dossh ROOT=${BINSLAVE_PORTAGE_CONFIGROOT} eselect profile set ${PROFILE}
+eend 0
+
+EMERGE_ARGS="--buildpkg --oneshot ${EMERGE_ARGS}"
+
+einfo "Determining which packages to merge remotely"
+
+# Save PKGLIST and PKGS for local emerge -K
+LOCAL_PKGLIST=${PKGLIST[@]}
+LOCAL_PKGS=${PKGS}
+
+as_pkglist_and_pkgs dossh PORTAGE_CONFIGROOT=${BINSLAVE_PORTAGE_CONFIGROOT} ${REMOTE_EMERGE} -pv ${EMERGE_ARGS}
+show_tmp_filtered
+
+for PKG in "${PKGLIST[@]}"; do
+	echo $PKG
+done
+
+askcont
+
+# To speed things up, run remote emerge with --nodeps and the package list obtained by the previous call
+#dossh PORTAGE_CONFIGROOT=${BINSLAVE_PORTAGE_CONFIGROOT} "${REMOTE_EMERGE}" ${EMERGE_ARGS} --nodeps ${PKGS} || die "Remote emerge failed"
+dossh PORTAGE_CONFIGROOT=${BINSLAVE_PORTAGE_CONFIGROOT} "${REMOTE_EMERGE}" ${EMERGE_ARGS} ${PKGS} || die "Remote emerge failed"
+
+ebegin "Pulling ${#LOCAL_PKGLIST[@]} packages from binslave"
+
+# Only pull the packages we need locally - the slave might have built
+# more due to missing dependencies.
+
+for PKG in ${LOCAL_PKGLIST[@]}; do
+	DESTDIR=${PKGDIR}/$(qatom ${PKG} | awk '{ print $1 }')
+	mkdir -p ${DESTDIR}
+	dopull "${BINSLAVE_PKGDIR}/${PKG}.tbz2" ${DESTDIR} || die "dopull"
+done
+
+eend 0
+
+emerge --nodeps -K ${LOCAL_PKGS}
